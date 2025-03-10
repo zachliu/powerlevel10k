@@ -5451,6 +5451,92 @@ _p9k_prompt_wifi_sync() {
   fi
 }
 
+function _p9k_mise_check_meta() {
+  [[ -n $_p9k_mise_meta_sig ]] || return
+  [[ -z $^_p9k_mise_meta_non_files(#qN) ]] || return
+  local -a stat
+  if (( $#_p9k_mise_meta_files )); then
+    zstat -A stat +mtime -- $_p9k_mise_meta_files 2>/dev/null || return
+  fi
+  [[ $_p9k_mise_meta_sig == $MISE_CONFIG_FILE$'\0'$MISE_DATA_DIR$'\0'${(pj:\0:)stat} ]] || return
+}
+
+function _p9k_mise_init_meta() {
+  local last_sig=$_p9k_mise_meta_sig
+  {
+    local -a files
+    local root=${MISE_DATA_DIR:-~/.local/share/mise}
+    files+=$root/plugins
+
+    _p9k_mise_plugins=()
+    _p9k_mise_file_info=()
+
+    if [[ -d $root/plugins ]]; then
+      local plugin
+      for plugin in $root/plugins/[^[:space:]]##(/N); do
+        files+=$root/installs/${plugin:t}
+        local -aU installed=($root/installs/${plugin:t}/[^[:space:]]##(/N:t) system)
+        _p9k_mise_plugins[${plugin:t}]=${(j:|:)${(@b)installed}}
+      done
+    fi
+
+    _p9k_mise_meta_files=($^files(N))
+    _p9k_mise_meta_non_files=(${files:|_p9k_mise_meta_files})
+
+    local -a stat
+    if (( $#_p9k_mise_meta_files )); then
+      zstat -A stat +mtime -- $_p9k_mise_meta_files 2>/dev/null || return
+    fi
+    _p9k_mise_meta_sig=$MISE_CONFIG_FILE$'\0'$MISE_DATA_DIR$'\0'${(pj:\0:)stat}
+    _p9k__mise_dir2files=()
+    _p9k_mise_file2versions=()
+  } always {
+    if (( $? == 0 )); then
+      _p9k__state_dump_scheduled=1
+      return
+    fi
+    [[ -n $last_sig ]] && _p9k__state_dump_scheduled=1
+    _p9k_mise_meta_files=()
+    _p9k_mise_meta_non_files=()
+    _p9k_mise_meta_sig=
+    _p9k_mise_plugins=()
+    _p9k_mise_file_info=()
+    _p9k__mise_dir2files=()
+    _p9k_mise_file2versions=()
+  }
+}
+
+function _p9k_mise_parse_version_file() {
+  local file=$1
+  local -a stat
+  zstat -A stat +mtime $file 2>/dev/null || return
+
+  local cached=$_p9k_mise_file2versions[:$file]
+  if [[ $cached == $stat[1]:* ]]; then
+    local file_versions=(${(0)${cached#*:}})
+  else
+    local file_versions=()
+    local versions_output=($(mise current 2>/dev/null))
+
+    for line in $versions_output; do
+      local words=($=line)
+      (( $#words > 1 )) || continue
+      local installed=$_p9k_mise_plugins[$words[1]]
+      [[ -n $installed ]] || continue
+      file_versions+=($words[1] ${${words:1}[(r)$installed]:-$words[2]})
+    done
+
+    _p9k_mise_file2versions[:$file]=$stat[1]:${(pj:\0:)file_versions}
+    _p9k__state_dump_scheduled=1
+  fi
+
+  local plugin version
+  for plugin version in $file_versions; do
+    : ${versions[$plugin]=$version}
+  done
+  return 0
+}
+
 function _p9k_asdf_check_meta() {
   [[ -n $_p9k_asdf_meta_sig ]] || return
   [[ -z $^_p9k_asdf_meta_non_files(#qN) ]] || return
@@ -5599,6 +5685,39 @@ function _p9k_asdf_parse_version_file() {
   return 0
 }
 
+function prompt_mise() {
+  _p9k_mise_check_meta || _p9k_mise_init_meta || return
+
+  local -A versions
+  local -a stat
+  local dirs=($_p9k__parent_dirs)
+  local mtimes=($_p9k__parent_mtimes)
+  if [[ $dirs[-1] != ~ ]]; then
+    zstat -A stat +mtime ~ 2>/dev/null || return
+    dirs+=(~)
+    mtimes+=($stat[1])
+  fi
+
+  local elem
+  for elem in ${(@)${:-{1..$#dirs}}/(#m)*/${${:-$MATCH:$_p9k__mise_dir2files[$dirs[MATCH]]}#$MATCH:$mtimes[MATCH]:}}; do
+    local files=(${(0)elem})
+    local file
+    for file in $files; do
+      _p9k_mise_parse_version_file $file || return
+    done
+  done
+
+  local plugin
+  for plugin in ${(k)_p9k_mise_plugins}; do
+    local upper=${${(U)plugin//-/_}//İ/I}
+    local version=$versions[$plugin]
+    [[ -n $version ]] || continue
+
+    _p9k_get_icon $0_$upper ${upper}_ICON $plugin
+    _p9k_prompt_segment $0_$upper green $_p9k_color1 $'\1'$_p9k__ret 0 '' ${version//\%/%%}
+  done
+}
+
 function prompt_asdf() {
   _p9k_asdf_check_meta || _p9k_asdf_init_meta || return
 
@@ -5687,6 +5806,10 @@ function prompt_asdf() {
     _p9k_get_icon $0_$upper ${upper}_ICON $plugin
     _p9k_prompt_segment $0_$upper green $_p9k_color1 $'\1'$_p9k__ret 0 '' ${version//\%/%%}
   done
+}
+
+_p9k_prompt_mise_init() {
+  typeset -g "_p9k__segment_cond_${_p9k__prompt_side}[_p9k__segment_index]"='${commands[mise]:-${${+functions[mise]}:#0}}'
 }
 
 _p9k_prompt_asdf_init() {
@@ -7211,6 +7334,15 @@ _p9k_init_vars() {
   typeset -gA _p9k_taskwarrior_counters
   typeset -gF _p9k_taskwarrior_next_due
 
+  typeset -ga _p9k_mise_meta_files
+  typeset -ga _p9k_mise_meta_non_files
+  typeset -g  _p9k_mise_meta_sig
+
+  typeset -gA _p9k_mise_plugins
+  typeset -gA _p9k_mise_file_info
+  typeset -gA _p9k__mise_dir2files
+  typeset -gA _p9k_mise_file2versions
+
   typeset -ga _p9k_asdf_meta_files
   typeset -ga _p9k_asdf_meta_non_files
   typeset -g  _p9k_asdf_meta_sig
@@ -7685,6 +7817,9 @@ _p9k_init_params() {
   _p9k_declare -b POWERLEVEL9K_GOENV_PROMPT_ALWAYS_SHOW 0
   _p9k_declare -a POWERLEVEL9K_GOENV_SOURCES -- shell local global
   _p9k_declare -b POWERLEVEL9K_GOENV_SHOW_SYSTEM 1
+  _p9k_declare -b POWERLEVEL9K_MISE_PROMPT_ALWAYS_SHOW 0
+  _p9k_declare -b POWERLEVEL9K_MISE_SHOW_SYSTEM 1
+  _p9k_declare -a POWERLEVEL9K_MISE_SOURCES -- shell local global
   _p9k_declare -b POWERLEVEL9K_ASDF_PROMPT_ALWAYS_SHOW 0
   _p9k_declare -b POWERLEVEL9K_ASDF_SHOW_SYSTEM 1
   _p9k_declare -a POWERLEVEL9K_ASDF_SOURCES -- shell local global
@@ -7697,6 +7832,15 @@ _p9k_init_params() {
   done
   for var in ${parameters[(I)POWERLEVEL9K_ASDF_*_SOURCES]}; do
     _p9k_declare -a $var -- $_POWERLEVEL9K_ASDF_SOURCES
+  done
+  for var in ${parameters[(I)POWERLEVEL9K_MISE_*_PROMPT_ALWAYS_SHOW]}; do
+    _p9k_declare -b $var $_POWERLEVEL9K_MISE_PROMPT_ALWAYS_SHOW
+  done
+  for var in ${parameters[(I)POWERLEVEL9K_MISE_*_SHOW_SYSTEM]}; do
+    _p9k_declare -b $var $_POWERLEVEL9K_MISE_SHOW_SYSTEM
+  done
+  for var in ${parameters[(I)POWERLEVEL9K_MISE_*_SOURCES]}; do
+    _p9k_declare -a $var -- $_POWERLEVEL9K_MISE_SOURCES
   done
   _p9k_declare -b POWERLEVEL9K_HASKELL_STACK_PROMPT_ALWAYS_SHOW 1
   _p9k_declare -a POWERLEVEL9K_HASKELL_STACK_SOURCES -- shell local
