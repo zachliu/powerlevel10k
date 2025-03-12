@@ -5521,9 +5521,6 @@ function _p9k_mise_parse_version_file() {
 
   # Check cache first
   local cached=$_p9k_mise_file2versions[:$file]
-  # echo $file
-  # echo $cached
-  # echo $stat[1]:*
   if [[ $cached == $stat[1]:* ]]; then
     local file_versions=(${(0)${cached#*:}})
   else
@@ -5546,9 +5543,6 @@ function _p9k_mise_parse_version_file() {
         local version_array=("$version")
         local final_version=${${version_array}[(r)$installed]:-$version}
 
-        # Debug output
-        # echo "DEBUG: Extracted tool='$tool', version='$version', installed='$installed', final='$final_version'" >&2
-
         file_versions+=($tool "$final_version")
       fi
     done
@@ -5560,7 +5554,6 @@ function _p9k_mise_parse_version_file() {
   # Store parsed versions per tool, ensuring full string expansion
   local plugin version
   for plugin version in $file_versions; do
-    # echo "DEBUG: version/plugin: [$plugin]: '${version}'" >&2
     : ${versions[$plugin]=$version}
   done
 
@@ -5734,24 +5727,48 @@ function prompt_mise() {
     if [[ $elem == *:* ]]; then
       local dir=$dirs[${elem%%:*}]
       zstat -A stat +mtime $dir 2>/dev/null || return
-      # If we reach `~`, check `~/.config/mise/config.toml` instead
-      # if [[ $dir == ~ ]]; then
-      #   local files=(~/.config/mise/config.toml(N))
-      # else
-        local files=($dir/mise.toml(N))
-      # fi
-      _p9k__mise_dir2files[$dir]=$stat[1]:${(pj:\0:)files}
+      # =======================================================================
+      # Since MISE doesn't have a "mise.toml" at the "~" directory, I have to
+      # do this to make sure p10k doesn't treat "~/.config/mise/config.toml" as
+      # a local "mise.toml" and starts to displaying every tool version in the
+      # prompt - TODO: Pending further extensive tests
+      # =======================================================================
+      if [[ $dir == ~ ]]; then
+        has_global=1
+        local -A local_versions=(${(kv)versions})
+        versions=()
+        local files=(~/.config/mise/config.toml(N))
+        # Ensure `~/.config/mise/config.toml` is NOT treated as a local mise.toml
+        _p9k__mise_dir2files[$dir]=""
+      else
+        local files=($dir/mise.toml(N) $dir/.mise.toml(N))
+        _p9k__mise_dir2files[$dir]=$stat[1]:${(pj:\0:)files}
+      fi
+      # =======================================================================
+      # In case the above doesn't work. Create a symbolic link at the "~" dir
+      # ln -s .config/mise/config.toml mise.toml
+      # and uncomment the following
+      # =======================================================================
+      # local files=($dir/mise.toml(N))
+      # _p9k__mise_dir2files[$dir]=$stat[1]:${(pj:\0:)files}
+      # =======================================================================
     else
       local files=(${(0)elem})
     fi
-    if [[ ${files[1]:h} == ~ ]]; then
-      has_global=1
-      local -A local_versions=(${(kv)versions})
-      versions=()
-    fi
+    # =======================================================================
+    # In case the above doesn't work. Create a symbolic link at the "~" dir
+    # ln -s .config/mise/config.toml mise.toml
+    # and uncomment the following
+    # =======================================================================
+    # if [[ ${files[1]:h} == ~ ]]; then
+    #   has_global=1
+    #   local -A local_versions=(${(kv)versions})
+    #   versions=()
+    # fi
+    # =======================================================================
     local file
     for file in $files; do
-      [[ $file == */mise.toml ]]
+      [[ $file == */mise.toml || $file == */.mise.toml ]]
       _p9k_mise_parse_version_file $file || return
     done
   done
@@ -5800,10 +5817,6 @@ function prompt_mise() {
         (( _POWERLEVEL9K_MISE_SHOW_SYSTEM )) || continue
       fi
     fi
-
-    # echo $plugin $version
-    # Debug output before displaying
-    # echo "DEBUG: Prompt will show '$plugin' version '$version'" >&2
 
     # Get the correct icon for the tool
     _p9k_get_icon $0_$upper ${upper}_ICON $plugin
