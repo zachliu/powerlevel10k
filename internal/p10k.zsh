@@ -5458,36 +5458,42 @@ function _p9k_mise_check_meta() {
   if (( $#_p9k_mise_meta_files )); then
     zstat -A stat +mtime -- $_p9k_mise_meta_files 2>/dev/null || return
   fi
-  [[ $_p9k_mise_meta_sig == $MISE_CONFIG_FILE$'\0'$MISE_DATA_DIR$'\0'${(pj:\0:)stat} ]] || return
+  [[ $_p9k_mise_meta_sig == ${(pj:\0:)stat} ]] || return
 }
 
 function _p9k_mise_init_meta() {
   local last_sig=$_p9k_mise_meta_sig
   {
     local -a files
-    local root=${MISE_DATA_DIR:-~/.local/share/mise}
-    files+=$root/plugins
 
     _p9k_mise_plugins=()
-    _p9k_mise_file_info=()
 
-    if [[ -d $root/plugins ]]; then
+    # Track global mise config file
+    local cfg=~/.config/mise/config.toml
+    files+=$cfg
+
+    # Track installed plugins
+    local root=~/.local/share/mise/installs
+    files+=$root
+    if [[ -d $root ]]; then
       local plugin
-      for plugin in $root/plugins/[^[:space:]]##(/N); do
-        files+=$root/installs/${plugin:t}
-        local -aU installed=($root/installs/${plugin:t}/[^[:space:]]##(/N:t) system)
+      for plugin in $root/[^[:space:]]##(/N); do
+        files+=$plugin
+        local -aU installed=($plugin/[^[:space:]]##(/N:t) system)
         _p9k_mise_plugins[${plugin:t}]=${(j:|:)${(@b)installed}}
       done
     fi
 
+    # Store tracked files
     _p9k_mise_meta_files=($^files(N))
     _p9k_mise_meta_non_files=(${files:|_p9k_mise_meta_files})
 
+    # Compute file modification timestamps
     local -a stat
     if (( $#_p9k_mise_meta_files )); then
       zstat -A stat +mtime -- $_p9k_mise_meta_files 2>/dev/null || return
     fi
-    _p9k_mise_meta_sig=$MISE_CONFIG_FILE$'\0'$MISE_DATA_DIR$'\0'${(pj:\0:)stat}
+    _p9k_mise_meta_sig=${(pj:\0:)stat}
     _p9k__mise_dir2files=()
     _p9k_mise_file2versions=()
   } always {
@@ -5500,40 +5506,64 @@ function _p9k_mise_init_meta() {
     _p9k_mise_meta_non_files=()
     _p9k_mise_meta_sig=
     _p9k_mise_plugins=()
-    _p9k_mise_file_info=()
     _p9k__mise_dir2files=()
     _p9k_mise_file2versions=()
   }
 }
 
+# Usage: _p9k_mise_parse_version_file <file>
+#
+# Mutates `versions` on success.
 function _p9k_mise_parse_version_file() {
   local file=$1
   local -a stat
   zstat -A stat +mtime $file 2>/dev/null || return
 
+  # Check cache first
   local cached=$_p9k_mise_file2versions[:$file]
+  # echo $file
+  # echo $cached
+  # echo $stat[1]:*
   if [[ $cached == $stat[1]:* ]]; then
     local file_versions=(${(0)${cached#*:}})
   else
     local file_versions=()
-    local versions_output=($(mise current 2>/dev/null))
+    # Read `mise.toml` and extract tool versions
+    { local lines=(${(@)${(@)${(f)"$(<$file)"}%$'\r'}/\#*}) } 2>/dev/null
+    local line
+    for line in $lines; do
+      [[ $line == "[tools]" ]] && continue
+      # Parse key-value pairs (e.g., `python = "3.7.4"`)
+      if [[ $line =~ '^\s*([^#]+?)\s*=\s*"(.*?)"' ]]; then
+        local tool=${match[1]//[[:space:]]/}   # Remove spaces from tool name
+        local version="${match[2]}"            # Preserve full version string
 
-    for line in $versions_output; do
-      local words=($=line)
-      (( $#words > 1 )) || continue
-      local installed=$_p9k_mise_plugins[$words[1]]
-      [[ -n $installed ]] || continue
-      file_versions+=($words[1] ${${words:1}[(r)$installed]:-$words[2]})
+        # Retrieve installed versions for this tool
+        local installed=$_p9k_mise_plugins[$tool]
+        [[ -n $installed ]] || continue  # Skip if not installed
+
+        # Ensure the selected version is in installed versions
+        local version_array=("$version")
+        local final_version=${${version_array}[(r)$installed]:-$version}
+
+        # Debug output
+        # echo "DEBUG: Extracted tool='$tool', version='$version', installed='$installed', final='$final_version'" >&2
+
+        file_versions+=($tool "$final_version")
+      fi
     done
-
+    # Cache the parsed result
     _p9k_mise_file2versions[:$file]=$stat[1]:${(pj:\0:)file_versions}
     _p9k__state_dump_scheduled=1
   fi
 
+  # Store parsed versions per tool, ensuring full string expansion
   local plugin version
   for plugin version in $file_versions; do
+    # echo "DEBUG: version/plugin: [$plugin]: '${version}'" >&2
     : ${versions[$plugin]=$version}
   done
+
   return 0
 }
 
@@ -5690,6 +5720,7 @@ function prompt_mise() {
 
   local -A versions
   local -a stat
+  local -i has_global
   local dirs=($_p9k__parent_dirs)
   local mtimes=($_p9k__parent_mtimes)
   if [[ $dirs[-1] != ~ ]]; then
@@ -5700,21 +5731,85 @@ function prompt_mise() {
 
   local elem
   for elem in ${(@)${:-{1..$#dirs}}/(#m)*/${${:-$MATCH:$_p9k__mise_dir2files[$dirs[MATCH]]}#$MATCH:$mtimes[MATCH]:}}; do
-    local files=(${(0)elem})
+    if [[ $elem == *:* ]]; then
+      local dir=$dirs[${elem%%:*}]
+      zstat -A stat +mtime $dir 2>/dev/null || return
+      # If we reach `~`, check `~/.config/mise/config.toml` instead
+      # if [[ $dir == ~ ]]; then
+      #   local files=(~/.config/mise/config.toml(N))
+      # else
+        local files=($dir/mise.toml(N))
+      # fi
+      _p9k__mise_dir2files[$dir]=$stat[1]:${(pj:\0:)files}
+    else
+      local files=(${(0)elem})
+    fi
+    if [[ ${files[1]:h} == ~ ]]; then
+      has_global=1
+      local -A local_versions=(${(kv)versions})
+      versions=()
+    fi
     local file
     for file in $files; do
+      [[ $file == */mise.toml ]]
       _p9k_mise_parse_version_file $file || return
     done
   done
 
+  if (( ! has_global )); then
+    has_global=1
+    local -A local_versions=(${(kv)versions})
+    versions=()
+  fi
+
   local plugin
   for plugin in ${(k)_p9k_mise_plugins}; do
     local upper=${${(U)plugin//-/_}//İ/I}
-    local version=$versions[$plugin]
-    [[ -n $version ]] || continue
+    if (( $+parameters[_POWERLEVEL9K_MISE_${upper}_SOURCES] )); then
+      local sources=(${(P)${:-_POWERLEVEL9K_MISE_${upper}_SOURCES}})
+    else
+      local sources=($_POWERLEVEL9K_MISE_SOURCES)
+    fi
 
+    local version="${(P)${:-MISE_${upper}_VERSION}}"
+    if [[ -n $version ]]; then
+      (( $sources[(I)shell] )) || continue
+    else
+      version=$local_versions[$plugin]
+      if [[ -n $version ]]; then
+        (( $sources[(I)local] )) || continue
+      else
+        version=$versions[$plugin]
+        [[ -n $version ]] || continue
+        (( $sources[(I)global] )) || continue
+      fi
+    fi
+
+    if [[ $version == $versions[$plugin] ]]; then
+      if (( $+parameters[_POWERLEVEL9K_MISE_${upper}_PROMPT_ALWAYS_SHOW] )); then
+        (( _POWERLEVEL9K_MISE_${upper}_PROMPT_ALWAYS_SHOW )) || continue
+      else
+        (( _POWERLEVEL9K_MISE_PROMPT_ALWAYS_SHOW )) || continue
+      fi
+    fi
+
+    if [[ $version == system ]]; then
+      if (( $+parameters[_POWERLEVEL9K_MISE_${upper}_SHOW_SYSTEM] )); then
+        (( _POWERLEVEL9K_MISE_${upper}_SHOW_SYSTEM )) || continue
+      else
+        (( _POWERLEVEL9K_MISE_SHOW_SYSTEM )) || continue
+      fi
+    fi
+
+    # echo $plugin $version
+    # Debug output before displaying
+    # echo "DEBUG: Prompt will show '$plugin' version '$version'" >&2
+
+    # Get the correct icon for the tool
     _p9k_get_icon $0_$upper ${upper}_ICON $plugin
-    _p9k_prompt_segment $0_$upper green $_p9k_color1 $'\1'$_p9k__ret 0 '' ${version//\%/%%}
+
+    # Display the segment with icon + version
+    _p9k_prompt_segment $0_$upper green $_p9k_color1 $'\1'${_p9k__ret% } 0 '' $version
   done
 }
 
@@ -7339,7 +7434,6 @@ _p9k_init_vars() {
   typeset -g  _p9k_mise_meta_sig
 
   typeset -gA _p9k_mise_plugins
-  typeset -gA _p9k_mise_file_info
   typeset -gA _p9k__mise_dir2files
   typeset -gA _p9k_mise_file2versions
 
